@@ -2,7 +2,7 @@ import React, { useState, useRef } from 'react';
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:5000';
 
-export default function CSVImporter({ members, onImportSuccess }) {
+export default function CSVImporter({ members, onImportSuccess, token, currentGroup }) {
   const [stagedItems, setStagedItems] = useState([]);
   const [report, setReport] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -26,12 +26,20 @@ export default function CSVImporter({ members, onImportSuccess }) {
     try {
       const res = await fetch(`${API_BASE}/api/import/stage`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
         body: JSON.stringify({ csvText })
       });
+      
+      if (!res.ok) {
+        throw new Error('Server returned an error for staging.');
+      }
+      
       const data = await res.json();
       
-      // Add 'selected' property to allow Meera to toggle rows
+      // Add 'selected' property to allow toggling rows
       const items = data.map(item => ({
         ...item,
         // Auto-uncheck exact duplicates, zero amounts, settlements, or conflicts
@@ -40,7 +48,7 @@ export default function CSVImporter({ members, onImportSuccess }) {
       setStagedItems(items);
     } catch (err) {
       console.error('Error uploading staging:', err);
-      alert('Staging upload failed. Ensure server is running.');
+      alert('Staging upload failed. Ensure server is running and you are logged in.');
     } finally {
       setIsLoading(false);
     }
@@ -53,7 +61,7 @@ export default function CSVImporter({ members, onImportSuccess }) {
       
       const updated = { ...item, [field]: value };
       
-      // If amount or splitWith changes, recalculate splits if needed
+      // If amount changes, parse it
       if (field === 'amount') {
         updated.amount = parseFloat(value) || 0;
       }
@@ -79,8 +87,11 @@ export default function CSVImporter({ members, onImportSuccess }) {
     try {
       const res = await fetch(`${API_BASE}/api/import/commit`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items: selectedItems })
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ items: selectedItems, groupId: currentGroup })
       });
       const data = await res.json();
       if (data.success) {
@@ -96,6 +107,27 @@ export default function CSVImporter({ members, onImportSuccess }) {
     } finally {
       setIsLoading(false);
     }
+  };
+
+  const handleDownloadReport = () => {
+    if (!report) return;
+    const reportText = `LEDGERMATE CSV DATA IMPORT REPORT
+==================================
+Timestamp: ${new Date(report.timestamp).toLocaleString('en-IN')}
+Workspace ID: ${currentGroup}
+Committed Expenses: ${report.insertedExpenses}
+Direct Settlements: ${report.insertedSettlements}
+Total Items Uploaded: ${report.totalReceived}
+Status: Successfully committed to PostgreSQL
+==================================`;
+    
+    const element = document.createElement("a");
+    const file = new Blob([reportText], { type: 'text/plain' });
+    element.href = URL.createObjectURL(file);
+    element.download = `ledgermate_import_${Date.now()}.txt`;
+    document.body.appendChild(element);
+    element.click();
+    document.body.removeChild(element);
   };
 
   const triggerFileSelect = () => {
@@ -157,11 +189,10 @@ export default function CSVImporter({ members, onImportSuccess }) {
                 <span className="stat-label">Direct Settlements</span>
                 <div className="report-num">{report.insertedSettlements}</div>
               </div>
-              <div className="report-card">
-                <span className="stat-label">Timestamp</span>
-                <div style={{ fontSize: '0.85rem', fontWeight: 600, marginTop: '0.8rem', color: 'var(--text-muted)' }}>
-                  {new Date(report.timestamp).toLocaleTimeString()}
-                </div>
+              <div className="report-card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <button className="btn-secondary" onClick={handleDownloadReport} style={{ width: '100%', padding: '0.5rem' }}>
+                  📥 Download Report
+                </button>
               </div>
             </div>
           </div>
@@ -273,7 +304,7 @@ export default function CSVImporter({ members, onImportSuccess }) {
                         ))}
                         {item.warnings.map((w, idx) => (
                           <span key={idx} className="anomaly-pill warning">
-                            ℹ️ {w.message}
+                            ℹ={w.message}
                           </span>
                         ))}
                         {item.anomalies.length === 0 && item.warnings.length === 0 && (

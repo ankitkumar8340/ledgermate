@@ -715,3 +715,34 @@ body {
 .animate-fade {
   animation: fadeIn 0.4s cubic-bezier(0.4, 0, 0.2, 1) forwards;
 }
+
+/* Login Page Styles */
+.login-container {
+  display: flex;
+  min-height: 100vh;
+  justify-content: center;
+  align-items: center;
+  background: var(--bg-gradient);
+}
+
+.login-card {
+  width: 420px;
+  padding: 2.5rem;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+  border: 1px solid var(--panel-border);
+}
+
+/* Audit Logs formatting */
+.audit-json-block {
+  background: rgba(0, 0, 0, 0.4);
+  padding: 0.5rem;
+  border-radius: 6px;
+  font-family: monospace;
+  font-size: 0.75rem;
+  max-height: 150px;
+  overflow-y: auto;
+  border: 1px solid var(--panel-border);
+  color: var(--primary);
+  text-align: left;
+}
+

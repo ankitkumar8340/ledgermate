@@ -5,10 +5,216 @@ import { processCSVData, calculateSplits } from '../utils/importer.js';
 
 const router = express.Router();
 
-// 1. GET /members - Fetch all users and memberships
+// Session verification middleware
+const authenticateSession = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Authentication token is missing' });
+  }
+  const token = authHeader.split(' ')[1];
+  try {
+    const sessionRes = await query(
+      `SELECT s.*, u.name, u.left_at FROM sessions s 
+       JOIN users u ON s.user_id = u.id 
+       WHERE s.token = $1 AND s.expires_at > CURRENT_TIMESTAMP`,
+      [token]
+    );
+    if (sessionRes.rows.length === 0) {
+      return res.status(401).json({ error: 'Session expired or invalid token' });
+    }
+    req.user = sessionRes.rows[0]; // { token, user_id, name, left_at }
+    next();
+  } catch (err) {
+    console.error('Session validation error:', err.message);
+    res.status(500).json({ error: 'Server error validating session' });
+  }
+};
+
+// Helper function to write audit log entries
+async function recordAuditLog(client, userId, action, tableName, rowId, oldValues, newValues) {
+  const auditId = `audit_${crypto.randomUUID().substring(0, 8)}`;
+  await client.query(
+    `INSERT INTO audit_logs (id, user_id, action, table_name, row_id, old_values, new_values) 
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [
+      auditId,
+      userId,
+      action,
+      tableName,
+      rowId,
+      oldValues ? JSON.stringify(oldValues) : null,
+      newValues ? JSON.stringify(newValues) : null
+    ]
+  );
+}
+
+// ----------------------------------------------------
+// AUTHENTICATION ENDPOINTS
+// ----------------------------------------------------
+
+// POST /auth/login - authenticate user and issue db-backed session token
+router.post('/auth/login', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password are required' });
+  }
+  try {
+    const userRes = await query('SELECT * FROM users WHERE name = $1', [username]);
+    if (userRes.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid username or password' });
+    }
+    const user = userRes.rows[0];
+    const salt = 'ledgermate-salt-1234';
+    const computedHash = crypto.scryptSync(password, salt, 64).toString('hex');
+    if (user.password_hash !== computedHash) {
+      return res.status(401).json({ error: 'Invalid username or password' });
+    }
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(); // 7 days
+
+    await query(
+      'INSERT INTO sessions (token, user_id, expires_at) VALUES ($1, $2, $3)',
+      [token, user.id, expiresAt]
+    );
+
+    res.json({ success: true, token, user: { id: user.id, name: user.name } });
+  } catch (err) {
+    console.error('Login error:', err.message);
+    res.status(500).json({ error: 'Internal server error during login' });
+  }
+});
+
+// POST /auth/logout - revoke session token
+router.post('/auth/logout', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(400).json({ error: 'No token provided' });
+  }
+  const token = authHeader.split(' ')[1];
+  try {
+    await query('DELETE FROM sessions WHERE token = $1', [token]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Logout error:', err.message);
+    res.status(500).json({ error: 'Internal server error during logout' });
+  }
+});
+
+// GET /auth/me - check token validity and get current user info
+router.get('/auth/me', authenticateSession, (req, res) => {
+  res.json({ user: { id: req.user.user_id, name: req.user.name } });
+});
+
+// ----------------------------------------------------
+// AUDIT LOG ENDPOINTS
+// ----------------------------------------------------
+router.get('/audit-logs', authenticateSession, async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT a.*, u.name AS user_name 
+       FROM audit_logs a 
+       JOIN users u ON a.user_id = u.id 
+       ORDER BY a.created_at DESC 
+       LIMIT 100`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching audit logs:', err.message);
+    res.status(500).json({ error: 'Database error fetching audit logs' });
+  }
+});
+
+// ----------------------------------------------------
+// GROUP MANAGEMENT ENDPOINTS
+// ----------------------------------------------------
+router.get('/groups', authenticateSession, async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT g.* FROM groups g
+       JOIN group_memberships gm ON g.id = gm.group_id
+       WHERE gm.user_id = $1
+       ORDER BY g.created_at DESC`,
+      [req.user.user_id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching groups:', err.message);
+    res.status(500).json({ error: 'Database error fetching groups' });
+  }
+});
+
+router.post('/groups', authenticateSession, async (req, res) => {
+  const { name, description, membersList } = req.body;
+  if (!name) return res.status(400).json({ error: 'Group name is required' });
+
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const groupId = `g_${crypto.randomUUID().substring(0, 8)}`;
+
+    await client.query(
+      `INSERT INTO groups (id, name, description) VALUES ($1, $2, $3)`,
+      [groupId, name, description || '']
+    );
+
+    const usersRes = await client.query('SELECT * FROM users');
+    const userMap = {};
+    usersRes.rows.forEach(u => {
+      userMap[u.name.toLowerCase()] = u.id;
+      userMap[u.id] = u.id;
+    });
+
+    const activeMemberIds = new Set();
+    activeMemberIds.add(req.user.user_id);
+
+    if (Array.isArray(membersList)) {
+      membersList.forEach(m => {
+        const id = userMap[m.toLowerCase()];
+        if (id) activeMemberIds.add(id);
+      });
+    }
+
+    for (const userId of activeMemberIds) {
+      const uInfo = usersRes.rows.find(u => u.id === userId);
+      const joined = uInfo ? uInfo.joined_at : new Date().toISOString();
+      const left = uInfo ? uInfo.left_at : null;
+
+      await client.query(
+        `INSERT INTO group_memberships (id, user_id, group_id, joined_at, left_at) 
+         VALUES ($1, $2, $3, $4, $5)`,
+        [`m_${crypto.randomUUID().substring(0, 8)}`, userId, groupId, joined, left]
+      );
+    }
+
+    await recordAuditLog(client, req.user.user_id, 'CREATE', 'groups', groupId, null, { name, description });
+
+    await client.query('COMMIT');
+    res.json({ success: true, group: { id: groupId, name, description } });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error creating group:', err.message);
+    res.status(500).json({ error: 'Database transaction error creating group: ' + err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ----------------------------------------------------
+// MEMBERS ENDPOINTS
+// ----------------------------------------------------
 router.get('/members', async (req, res) => {
   try {
-    const result = await query('SELECT * FROM users ORDER BY name ASC');
+    const groupId = req.query.group_id || 'g_flat';
+    // Load members active in the requested group
+    const result = await query(
+      `SELECT u.*, gm.joined_at AS group_joined_at, gm.left_at AS group_left_at 
+       FROM users u
+       JOIN group_memberships gm ON u.id = gm.user_id
+       WHERE gm.group_id = $1
+       ORDER BY u.name ASC`,
+      [groupId]
+    );
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching members:', err.message);
@@ -16,18 +222,22 @@ router.get('/members', async (req, res) => {
   }
 });
 
-// 2. POST /members - Add or update a member's active period
-router.post('/members', async (req, res) => {
-  const { name, joinedAt, leftAt } = req.body;
+router.post('/members', authenticateSession, async (req, res) => {
+  const { name, joinedAt, leftAt, groupId } = req.body;
   if (!name) return res.status(400).json({ error: 'Name is required' });
 
+  const client = await getClient();
   try {
+    await client.query('BEGIN');
+    const targetGroup = groupId || 'g_flat';
     const userId = `u_${name.toLowerCase().replace(/\s+/g, '_')}`;
     const joined = joinedAt ? new Date(joinedAt).toISOString() : new Date('2026-02-01').toISOString();
     const left = leftAt ? new Date(leftAt).toISOString() : null;
 
-    // Use Postgres UPSERT (INSERT ... ON CONFLICT)
-    await query(
+    const oldUserRes = await client.query('SELECT * FROM users WHERE id = $1', [userId]);
+    const isNew = oldUserRes.rows.length === 0;
+
+    await client.query(
       `INSERT INTO users (id, name, joined_at, left_at) 
        VALUES ($1, $2, $3, $4) 
        ON CONFLICT (name) 
@@ -35,24 +245,39 @@ router.post('/members', async (req, res) => {
       [userId, name, joined, left]
     );
 
-    // Also upsert default group membership (g_flat)
-    await query(
+    await client.query(
       `INSERT INTO group_memberships (id, user_id, group_id, joined_at, left_at) 
        VALUES ($1, $2, $3, $4, $5) 
        ON CONFLICT (user_id, group_id) 
        DO UPDATE SET joined_at = EXCLUDED.joined_at, left_at = EXCLUDED.left_at`,
-      [`m_${userId}`, userId, 'g_flat', joined, left]
+      [`m_${userId}`, userId, targetGroup, joined, left]
     );
 
+    await recordAuditLog(
+      client,
+      req.user.user_id,
+      isNew ? 'CREATE' : 'UPDATE',
+      'users',
+      userId,
+      oldUserRes.rows[0] || null,
+      { name, joined_at: joined, left_at: left }
+    );
+
+    await client.query('COMMIT');
     res.json({ success: true, member: { id: userId, name, joinedAt: joined, leftAt: left } });
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error('Error saving member:', err.message);
-    res.status(500).json({ error: 'Database error saving member' });
+    res.status(500).json({ error: 'Database transaction error saving member' });
+  } finally {
+    client.release();
   }
 });
 
-// 3. POST /import/stage - Parse CSV and return warnings & staging list
-router.post('/import/stage', (req, res) => {
+// ----------------------------------------------------
+// CSV IMPORT ENDPOINTS
+// ----------------------------------------------------
+router.post('/import/stage', authenticateSession, (req, res) => {
   const { csvText } = req.body;
   if (!csvText) return res.status(400).json({ error: 'CSV content is empty' });
 
@@ -65,13 +290,13 @@ router.post('/import/stage', (req, res) => {
   }
 });
 
-// 4. POST /import/commit - Commit the staging rows into database
-router.post('/import/commit', async (req, res) => {
-  const { items } = req.body; // Array of approved/edited rows from staging
+router.post('/import/commit', authenticateSession, async (req, res) => {
+  const { items, groupId } = req.body;
   if (!items || !Array.isArray(items)) {
     return res.status(400).json({ error: 'No items provided for import commit.' });
   }
 
+  const targetGroup = groupId || 'g_flat';
   const client = await getClient();
   try {
     await client.query('BEGIN');
@@ -80,11 +305,9 @@ router.post('/import/commit', async (req, res) => {
       totalReceived: items.length,
       insertedExpenses: 0,
       insertedSettlements: 0,
-      anomaliesResolved: 0,
       timestamp: new Date()
     };
 
-    // Fetch user map to translate names to IDs
     const usersRes = await client.query('SELECT * FROM users');
     const userMap = {};
     usersRes.rows.forEach(u => {
@@ -106,10 +329,8 @@ router.post('/import/commit', async (req, res) => {
         isSettlement
       } = item;
 
-      // Translate payer name to ID. Default to u_unknown if not matched.
       const paidById = userMap[paidBy.toLowerCase()] || 'u_unknown';
 
-      // Ensure u_unknown exists in database if we have a missing payer row
       if (paidById === 'u_unknown') {
         await client.query(
           `INSERT INTO users (id, name, joined_at) 
@@ -118,16 +339,14 @@ router.post('/import/commit', async (req, res) => {
         );
       }
 
-      // Generate a unique ID for the expense
       const expenseId = `exp_${crypto.randomUUID().substring(0, 8)}`;
 
-      // Insert Expense
       await client.query(
         `INSERT INTO expenses (id, group_id, description, amount, currency, exchange_rate, date, paid_by_id, split_type, split_details, notes, is_settlement) 
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
         [
           expenseId,
-          'g_flat',
+          targetGroup,
           description,
           amount,
           currency,
@@ -143,10 +362,7 @@ router.post('/import/commit', async (req, res) => {
 
       if (isSettlement) {
         importReport.insertedSettlements++;
-        
-        // For settlements, we create a single split representing the recipient
-        // splitWith contains the recipient user
-        splitWith.forEach(async (recipientName) => {
+        for (const recipientName of splitWith) {
           const recipientId = userMap[recipientName.toLowerCase()];
           if (recipientId) {
             await client.query(
@@ -155,11 +371,9 @@ router.post('/import/commit', async (req, res) => {
               [`split_${crypto.randomUUID().substring(0, 8)}`, expenseId, recipientId, amount]
             );
           }
-        });
+        }
       } else {
         importReport.insertedExpenses++;
-
-        // Map splits
         const normalizedSplits = item.normalizedSplits || [];
         const splits = calculateSplits(amount, splitType, normalizedSplits);
 
@@ -175,6 +389,8 @@ router.post('/import/commit', async (req, res) => {
           }
         }
       }
+
+      await recordAuditLog(client, req.user.user_id, 'CREATE', 'expenses', expenseId, null, { description, amount, isSettlement });
     }
 
     await client.query('COMMIT');
@@ -188,23 +404,31 @@ router.post('/import/commit', async (req, res) => {
   }
 });
 
-// 5. GET /ledger - Returns all expenses and their splitting details
+// ----------------------------------------------------
+// EXPENSES & SPLITS ENDPOINTS
+// ----------------------------------------------------
 router.get('/ledger', async (req, res) => {
   try {
+    const groupId = req.query.group_id || 'g_flat';
+
     const expensesRes = await query(
       `SELECT e.*, u.name AS paid_by_name 
        FROM expenses e 
        JOIN users u ON e.paid_by_id = u.id 
-       ORDER BY e.date ASC`
+       WHERE e.group_id = $1
+       ORDER e.date ASC`,
+      [groupId]
     );
 
     const splitsRes = await query(
       `SELECT s.*, u.name AS user_name 
        FROM expense_splits s 
-       JOIN users u ON s.user_id = u.id`
+       JOIN users u ON s.user_id = u.id
+       JOIN expenses e ON s.expense_id = e.id
+       WHERE e.group_id = $1`,
+      [groupId]
     );
 
-    // Group splits by expense_id
     const splitsMap = {};
     splitsRes.rows.forEach(s => {
       if (!splitsMap[s.expense_id]) {
@@ -213,7 +437,6 @@ router.get('/ledger', async (req, res) => {
       splitsMap[s.expense_id].push(s);
     });
 
-    // Assemble expenses
     const ledger = expensesRes.rows.map(e => ({
       ...e,
       splits: splitsMap[e.id] || []
@@ -226,30 +449,31 @@ router.get('/ledger', async (req, res) => {
   }
 });
 
-// 6. DELETE /expenses/:id - Delete an expense
-router.delete('/expenses/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    await query('DELETE FROM expenses WHERE id = $1', [id]);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Error deleting expense:', err.message);
-    res.status(500).json({ error: 'Database error deleting expense' });
-  }
-});
+router.post('/expenses', authenticateSession, async (req, res) => {
+  const {
+    description,
+    amount,
+    currency,
+    exchangeRate,
+    date,
+    paidBy,
+    splitType,
+    splitWith,
+    splitDetails,
+    notes,
+    isSettlement,
+    groupId
+  } = req.body;
 
-// 7. POST /expenses - Create single expense manually
-router.post('/expenses', async (req, res) => {
-  const { description, amount, currency, exchangeRate, date, paidBy, splitType, splitWith, splitDetails, notes, isSettlement } = req.body;
-  
-  if (!description || !amount || !paidBy) {
+  if (!description || amount === undefined || !paidBy) {
     return res.status(400).json({ error: 'Missing required parameters' });
   }
 
+  const targetGroup = groupId || 'g_flat';
   const client = await getClient();
   try {
     await client.query('BEGIN');
-    
+
     // Map names to IDs
     const usersRes = await client.query('SELECT * FROM users');
     const userMap = {};
@@ -262,6 +486,50 @@ router.post('/expenses', async (req, res) => {
       throw new Error(`Payer '${paidBy}' is not a registered flatmate.`);
     }
 
+    // Temporal Validation Rules
+    const membershipsRes = await client.query(
+      `SELECT gm.user_id, u.name, gm.joined_at, gm.left_at 
+       FROM group_memberships gm
+       JOIN users u ON gm.user_id = u.id
+       WHERE gm.group_id = $1`,
+      [targetGroup]
+    );
+
+    const membersMap = {};
+    membershipsRes.rows.forEach(m => {
+      membersMap[m.name.toLowerCase()] = m;
+    });
+
+    const expenseDate = new Date(date || new Date().toISOString());
+
+    // Validate payer active date
+    const payerInfo = membersMap[paidBy.toLowerCase()];
+    if (!payerInfo) {
+      throw new Error(`Payer '${paidBy}' is not a member of this group.`);
+    }
+    if (expenseDate < new Date(payerInfo.joined_at)) {
+      throw new Error(`Payer ${paidBy} was not a member on this date (joined ${payerInfo.joined_at.toISOString().split('T')[0]}).`);
+    }
+    if (payerInfo.left_at && expenseDate > new Date(payerInfo.left_at)) {
+      throw new Error(`Payer ${paidBy} had left the group on this date (left ${payerInfo.left_at.toISOString().split('T')[0]}).`);
+    }
+
+    // Validate split participants active dates
+    if (!isSettlement && Array.isArray(splitWith)) {
+      for (const name of splitWith) {
+        const rInfo = membersMap[name.toLowerCase()];
+        if (!rInfo) {
+          throw new Error(`Split participant '${name}' is not a member of this group.`);
+        }
+        if (expenseDate < new Date(rInfo.joined_at)) {
+          throw new Error(`Split participant ${name} was not active on this date (joined ${rInfo.joined_at.toISOString().split('T')[0]}).`);
+        }
+        if (rInfo.left_at && expenseDate > new Date(rInfo.left_at)) {
+          throw new Error(`Split participant ${name} had left on this date (left ${rInfo.left_at.toISOString().split('T')[0]}).`);
+        }
+      }
+    }
+
     const expenseId = `exp_${crypto.randomUUID().substring(0, 8)}`;
 
     await client.query(
@@ -269,12 +537,12 @@ router.post('/expenses', async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
       [
         expenseId,
-        'g_flat',
+        targetGroup,
         description,
         amount,
         currency || 'INR',
         exchangeRate || 1.0,
-        date || new Date().toISOString(),
+        expenseDate.toISOString(),
         paidById,
         splitType || 'equal',
         splitDetails || '',
@@ -284,7 +552,6 @@ router.post('/expenses', async (req, res) => {
     );
 
     if (isSettlement) {
-      // splitWith is an array containing the recipient name
       for (const recipientName of splitWith) {
         const recipientId = userMap[recipientName.toLowerCase()];
         if (recipientId) {
@@ -299,7 +566,21 @@ router.post('/expenses', async (req, res) => {
       // Calculate splits
       const tempSplits = [];
       splitWith.forEach(u => {
-        tempSplits.push({ user: u, share: 1 }); // Equal weighted default for manual entry
+        // Find if custom details specifies share/percentage
+        let share = 1;
+        if (splitType === 'unequal' || splitType === 'percentage' || splitType === 'share') {
+          // Parse split details for this user
+          const parts = splitDetails.split(';').map(p => p.trim());
+          for (const p of parts) {
+            const match = p.match(/^([A-Za-z\s]+)\s+(\d+(?:\.\d+)?)(%?)$/);
+            if (match && match[1].toLowerCase().trim() === u.toLowerCase()) {
+              share = parseFloat(match[2]);
+              if (match[3] === '%') share = share / 100;
+              break;
+            }
+          }
+        }
+        tempSplits.push({ user: u, share });
       });
 
       const splits = calculateSplits(amount, splitType || 'equal', tempSplits);
@@ -315,6 +596,16 @@ router.post('/expenses', async (req, res) => {
       }
     }
 
+    await recordAuditLog(
+      client,
+      req.user.user_id,
+      'CREATE',
+      'expenses',
+      expenseId,
+      null,
+      { description, amount, isSettlement }
+    );
+
     await client.query('COMMIT');
     res.json({ success: true, expenseId });
   } catch (err) {
@@ -326,29 +617,78 @@ router.post('/expenses', async (req, res) => {
   }
 });
 
-// 8. GET /settlements - Calculates simplified net balances and Rohan's detailed ledger
+router.delete('/expenses/:id', authenticateSession, async (req, res) => {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const { id } = req.params;
+
+    const expRes = await client.query('SELECT * FROM expenses WHERE id = $1', [id]);
+    if (expRes.rows.length === 0) {
+      throw new Error('Expense record not found');
+    }
+
+    await client.query('DELETE FROM expenses WHERE id = $1', [id]);
+
+    await recordAuditLog(
+      client,
+      req.user.user_id,
+      'DELETE',
+      'expenses',
+      id,
+      expRes.rows[0],
+      null
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error deleting expense:', err.message);
+    res.status(500).json({ error: 'Database transaction error deleting expense: ' + err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ----------------------------------------------------
+// SETTLEMENTS & CALCULATION ENDPOINTS
+// ----------------------------------------------------
 router.get('/settlements', async (req, res) => {
   try {
+    const groupId = req.query.group_id || 'g_flat';
+
     const expensesRes = await query(
       `SELECT e.*, u.name AS paid_by_name 
        FROM expenses e 
-       JOIN users u ON e.paid_by_id = u.id`
+       JOIN users u ON e.paid_by_id = u.id
+       WHERE e.group_id = $1`,
+      [groupId]
     );
+
     const splitsRes = await query(
       `SELECT s.*, u.name AS user_name 
        FROM expense_splits s 
-       JOIN users u ON s.user_id = u.id`
+       JOIN users u ON s.user_id = u.id
+       JOIN expenses e ON s.expense_id = e.id
+       WHERE e.group_id = $1`,
+      [groupId]
     );
-    const usersRes = await query('SELECT * FROM users WHERE name != \'Unknown\'');
+
+    const usersRes = await query(
+      `SELECT u.* FROM users u
+       JOIN group_memberships gm ON u.id = gm.user_id
+       WHERE gm.group_id = $1 AND u.name != 'Unknown'`,
+      [groupId]
+    );
 
     const expenses = expensesRes.rows;
     const splits = splitsRes.rows;
     const users = usersRes.rows;
 
-    // A. Calculate Net Balances in INR
     const balances = {};
-    const userTimeline = {}; // Tracks join/leave dates for display
-    
+    const userTimeline = {};
+
     users.forEach(u => {
       balances[u.name] = 0;
       userTimeline[u.name] = { joined: u.joined_at, left: u.left_at };
@@ -356,27 +696,22 @@ router.get('/settlements', async (req, res) => {
 
     expenses.forEach(e => {
       const payer = e.paid_by_name;
-      if (!balances.hasOwnProperty(payer)) return; // Ignore if deleted/unknown
+      if (!balances.hasOwnProperty(payer)) return;
 
       const rate = Number(e.exchange_rate) || 1.0;
       const amountINR = Number(e.amount) * rate;
 
       if (e.is_settlement) {
-        // Settlement: Payer gets credited (paid back), recipient gets debited (received)
         balances[payer] += amountINR;
-        
         const eSplits = splits.filter(s => s.expense_id === e.id);
         eSplits.forEach(s => {
           const recipient = s.user_name;
           if (balances.hasOwnProperty(recipient)) {
-            balances[recipient] -= amountINR; // Recipient received the money, decreasing their credit or increasing their debt to the pool
+            balances[recipient] -= amountINR;
           }
         });
       } else {
-        // Shared Expense: Payer gets credit for full amount
         balances[payer] += amountINR;
-
-        // Split users get debited for their share
         const eSplits = splits.filter(s => s.expense_id === e.id);
         eSplits.forEach(s => {
           const debtor = s.user_name;
@@ -387,27 +722,23 @@ router.get('/settlements', async (req, res) => {
       }
     });
 
-    // Round balances to 2 decimal places
     Object.keys(balances).forEach(name => {
       balances[name] = Math.round(balances[name] * 100) / 100;
     });
 
-    // B. Calculate Simplified Settlement Transactions (Aisha's View)
-    // Debt Simplification Algorithm
     const debtsList = [];
     Object.entries(balances).forEach(([name, bal]) => {
-      // Exclude guests who have 0 balances or very minor residuals
       if (Math.abs(bal) > 0.05) {
         debtsList.push({ name, balance: bal });
       }
     });
 
     const settlements = [];
-    let debtors = debtsList.filter(d => d.balance < 0).sort((a, b) => a.balance - b.balance); // Sorted ascending (most negative first)
-    let creditors = debtsList.filter(d => d.balance > 0).sort((a, b) => b.balance - a.balance); // Sorted descending (most positive first)
+    let debtors = debtsList.filter(d => d.balance < 0).sort((a, b) => a.balance - b.balance);
+    let creditors = debtsList.filter(d => d.balance > 0).sort((a, b) => b.balance - a.balance);
 
-    let i = 0; // Debtor ptr
-    let j = 0; // Creditor ptr
+    let i = 0;
+    let j = 0;
 
     while (i < debtors.length && j < creditors.length) {
       const debtor = debtors[i];
@@ -432,18 +763,15 @@ router.get('/settlements', async (req, res) => {
       if (Math.abs(creditor.balance) < 0.02) j++;
     }
 
-    // C. Detailed ledger trace per user (Rohan's View)
     const ledgersBreakdown = {};
     users.forEach(u => {
       const userLedger = [];
       let runningBalanceINR = 0;
 
-      // Filter all non-settlement expenses where user paid or participated
       expenses.forEach(e => {
         const rate = Number(e.exchange_rate) || 1.0;
         const paidAmount = e.paid_by_id === u.id ? Number(e.amount) : 0;
         
-        // Find if user is in splits
         const userSplit = splits.find(s => s.expense_id === e.id && s.user_id === u.id);
         const owedAmount = userSplit ? Number(userSplit.amount) : 0;
 
@@ -455,13 +783,11 @@ router.get('/settlements', async (req, res) => {
           let detailsText = '';
 
           if (e.is_settlement) {
-            // Settlements
-            netEffectINR = paidINR - owedINR; // Owed is positive for recipient, so net effect is -owedINR
+            netEffectINR = paidINR - owedINR;
             detailsText = paidAmount > 0 
               ? `Repayment/Settlement paid to ${splits.filter(s => s.expense_id === e.id).map(s => s.user_name).join(', ')}`
               : `Repayment/Settlement received from ${e.paid_by_name}`;
           } else {
-            // Expenses
             netEffectINR = paidINR - owedINR;
             detailsText = paidAmount > 0 
               ? `You paid ${e.currency} ${e.amount}. Your share: ${e.currency} ${owedAmount}.`

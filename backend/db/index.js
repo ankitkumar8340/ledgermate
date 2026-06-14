@@ -1,6 +1,7 @@
 import pkg from 'pg';
 const { Pool } = pkg;
 import dotenv from 'dotenv';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -32,8 +33,14 @@ export const initDB = async () => {
         name VARCHAR(100) UNIQUE NOT NULL,
         email VARCHAR(255) UNIQUE,
         joined_at TIMESTAMP NOT NULL,
-        left_at TIMESTAMP
+        left_at TIMESTAMP,
+        password_hash VARCHAR(255)
       );
+    `);
+
+    // Ensure password_hash exists if database is already created
+    await client.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
     `);
 
     // 2. Create Groups Table
@@ -93,26 +100,63 @@ export const initDB = async () => {
       );
     `);
 
+    // 6. Create Sessions Table for Database-backed Auth
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        token VARCHAR(100) PRIMARY KEY,
+        user_id VARCHAR(50) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMP NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+    `);
+
+    // 7. Create Audit Logs Table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id VARCHAR(50) PRIMARY KEY,
+        user_id VARCHAR(50) NOT NULL,
+        action VARCHAR(50) NOT NULL,
+        table_name VARCHAR(50) NOT NULL,
+        row_id VARCHAR(50) NOT NULL,
+        old_values TEXT,
+        new_values TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // 8. Create Foreign Key Performance Indexes
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_memberships_user ON group_memberships(user_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_memberships_group ON group_memberships(group_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_expenses_group ON expenses(group_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_expenses_payer ON expenses(paid_by_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_splits_expense ON expense_splits(expense_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_splits_user ON expense_splits(user_id);`);
+
     await client.query('COMMIT');
     console.log('PostgreSQL tables initialized successfully.');
 
     // Seed default users if table is empty
     const usersCount = await client.query('SELECT COUNT(*) FROM users');
+    const defaultUsers = [
+      { id: 'u_aisha', name: 'Aisha', joined_at: '2026-02-01', left_at: null, password: 'aisha' },
+      { id: 'u_rohan', name: 'Rohan', joined_at: '2026-02-01', left_at: null, password: 'rohan' },
+      { id: 'u_priya', name: 'Priya', joined_at: '2026-02-01', left_at: null, password: 'priya' },
+      { id: 'u_meera', name: 'Meera', joined_at: '2026-02-01', left_at: '2026-03-31', password: 'meera' },
+      { id: 'u_sam', name: 'Sam', joined_at: '2026-04-15', left_at: null, password: 'sam' },
+      { id: 'u_dev', name: 'Dev', joined_at: '2026-02-01', left_at: null, password: 'dev' },
+      { id: 'u_kabir', name: 'Kabir', joined_at: '2026-03-11', left_at: '2026-03-11', password: 'kabir' }
+    ];
+    
+    const salt = 'ledgermate-salt-1234';
+
     if (parseInt(usersCount.rows[0].count, 10) === 0) {
       console.log('Seeding default flatmates...');
-      const defaultUsers = [
-        { id: 'u_aisha', name: 'Aisha', joined_at: '2026-02-01', left_at: null },
-        { id: 'u_rohan', name: 'Rohan', joined_at: '2026-02-01', left_at: null },
-        { id: 'u_priya', name: 'Priya', joined_at: '2026-02-01', left_at: null },
-        { id: 'u_meera', name: 'Meera', joined_at: '2026-02-01', left_at: '2026-03-31' },
-        { id: 'u_sam', name: 'Sam', joined_at: '2026-04-15', left_at: null },
-        { id: 'u_dev', name: 'Dev', joined_at: '2026-02-01', left_at: null },
-        { id: 'u_kabir', name: 'Kabir', joined_at: '2026-03-11', left_at: '2026-03-11' }
-      ];
       for (const u of defaultUsers) {
+        const hash = crypto.scryptSync(u.password, salt, 64).toString('hex');
         await client.query(
-          'INSERT INTO users (id, name, joined_at, left_at) VALUES ($1, $2, $3, $4)',
-          [u.id, u.name, u.joined_at, u.left_at]
+          'INSERT INTO users (id, name, joined_at, left_at, password_hash) VALUES ($1, $2, $3, $4, $5)',
+          [u.id, u.name, u.joined_at, u.left_at, hash]
         );
       }
       
@@ -130,6 +174,15 @@ export const initDB = async () => {
         );
       }
       console.log('Seeding completed.');
+    } else {
+      // Ensure existing users have a password hash
+      for (const u of defaultUsers) {
+        const hash = crypto.scryptSync(u.password, salt, 64).toString('hex');
+        await client.query(
+          'UPDATE users SET password_hash = $1 WHERE id = $2 AND password_hash IS NULL',
+          [hash, u.id]
+        );
+      }
     }
   } catch (err) {
     await client.query('ROLLBACK');
