@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: ledgermate-backend
+    runtime: node
+    rootDir: .
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false   # You will paste this from Neon in the Render dashboard
+      - key: JWT_SECRET
+        generateValue: true
+      - key: FRONTEND_URL
+        sync: false   # You will paste your Vercel URL here after deploying frontend

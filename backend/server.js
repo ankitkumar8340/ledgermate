@@ -9,11 +9,20 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Enable CORS for frontend requests
-app.use(cors());
+// CORS — allow configured frontend origin in production, all origins in dev
+const allowedOrigins = process.env.FRONTEND_URL
+  ? [process.env.FRONTEND_URL]
+  : true; // allow all in development
+
+app.use(cors({
+  origin: allowedOrigins,
+  credentials: true,
+}));
+
 // Parse incoming JSON requests
 app.use(express.json({ limit: '10mb' }));
-// Serve a clean check route
+
+// Health check route (used by Render)
 app.get('/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date() });
 });
@@ -37,3 +46,4 @@ const startServer = async () => {
 };
 
 startServer();
+
