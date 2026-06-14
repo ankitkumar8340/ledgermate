@@ -416,7 +416,7 @@ router.get('/ledger', async (req, res) => {
        FROM expenses e 
        JOIN users u ON e.paid_by_id = u.id 
        WHERE e.group_id = $1
-       ORDER e.date ASC`,
+       ORDER BY e.date ASC`,
       [groupId]
     );
 
